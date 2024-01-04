@@ -1,0 +1,637 @@
+<!doctype HTML>
+<head>
+  <!-- create canvas and link all scripts -->
+  <canvas id='canvas1' width='360' height='240'></canvas>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/fpsmeter/0.3.1/fpsmeter.min.js" integrity="sha512-60sOFuolHKjKWm4IcltFrnIvq2slKdPjz1i9WzZMzLDaYSUuwhvxg4Ku/eBnFejYJBuHce9hSvcngBSK9pEV1g==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.3.1/p5.js"></script>
+  <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/0.4.8/addons/p5.sound-min.js"></script>
+  <script src="voxelData.js"></script>
+  <script src="helper functions.js"></script>
+  <script src="noise.js"></script>
+  <script src="soundSetup.js"></script>
+  <script src="particle.js"></script>
+  <script src="projectile.js"></script>
+  <script src="player.js"></script>
+  <script src="enemy.js"></script>
+  <script src="main.js"></script>
+  <script src="gl_utils.js"></script>
+  <link href="style.css" rel="stylesheet" type="text/css" />
+
+  <title>cyberDOOM</title>
+</head>
+<body bgcolor=white>
+
+<!-- basic screenquad vertex shader, simply returns vertex position with no alteration (this shader is from https://github.com/neosavvyinc/WebGL) -->
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+in vec3 aPosition;
+out vec3 vPosition;
+void main() {
+  gl_Position = vec4(aPosition, 1.0);
+  vPosition = aPosition; // interpolate the vertex position and pass to fragment shader
+}
+</script>
+<!-- main path tracing shader, does all the actual rendering -->
+<script id="fs" type="x-shader/x-fragment">#version 300 es
+precision mediump float;// set precisions
+precision mediump sampler3D;
+
+uniform sampler3D map;// the actual map that will be renderer
+uniform sampler2D megaTexture;// any 2D/ image data that will be used.
+uniform sampler2D lastFrame;// the last frame rendered so I can do temporal accumulation
+
+out vec4 FragColor;//shader return value
+uniform float uTime;//time since initilization
+in vec3 vPosition;// vertex position which is interpolated by vertex shader to get pixel position.
+float x;
+float y;
+float z;
+const float sizeX =256.0;const float sizeY = 20.0; const float sizeZ = 256.0; //deffine size of voxel grid bounds
+uniform vec3 uCursor;
+const int NUM_OBJECTS = 64;
+
+uniform vec3 cPos; // camera position
+uniform float randSeed; //cpu random seed
+uniform float thetaY;// camera rotations
+uniform float thetaX;
+uniform vec3 objects[32];// objects and lights (not currently used)
+uniform vec3 lPos[4];                                 
+uniform vec3 lCol[4];
+uniform float weaponOffset;// ofset of currently equiped weapon in megatexture
+
+vec3 sunDirection = normalize(vec3(0.5,1.0,0.6));// global parameters deffining sun and fog.
+vec3 sunColour = vec3(0.9,0.9,0.7)*8.0;
+vec3 ambientColor = vec3(0.13,0.2,0.23);
+vec3 fogColour = vec3(0.5,0.5,0.6)*0.5;
+
+float a = 0.03; // fog parameters
+float b = 0.1;
+
+struct Ray { // holds all data needed to describe a ray (origin and direction)
+    vec3 origin;
+    vec3 direction;
+};
+
+struct Voxel{ // holds data about a single voxel
+  vec3 color; // the voxel's colour
+  int matIndex; // the voxel's material
+  float reflectance; // the voxel's reflectivity
+};
+
+struct Material{// holds all parameters for a materal (colour is part of the voxel struct)
+  float specular;
+  float diffuse;
+  float roughness;  
+};
+
+
+const Material materials[5] = Material[5](Material(0.0,1.0,1.0),Material(1.0,0.0,0.05),Material(0.5,0.5,0.02),Material(1.0,0.0,0.0),Material(0.9,0.1,0.01)); // deffine an array of materials with diffuse glossy and rough metal.
+
+Voxel nullVoxel = Voxel(vec3(0.0),0,0.0);
+Voxel volumetricVoxel = Voxel(vec3(1.0),0,0.0);
+
+
+struct Hit{ //holds all data about a ray-scene intersection
+  Voxel voxel; // the voxel that is intersected
+  float minDist; // the distance from camera to intersection point
+  bool hasHit;
+  vec3 normal; //normal at intersection
+  float density; // how much participating medium is along ray (used for volumetrics)
+};
+
+
+mat3 rotY(float theta){ // returns Y rotation vector for theta, rotates vector theta degrees around Y axis
+  return mat3(cos(theta),0,sin(theta),
+              0,1,0,
+              -sin(theta),0,cos(theta)
+  );
+}
+mat3 rotX(float theta){// returns X rotation vector for theta, rotates vector theta degrees around X axis
+  return mat3(1,0,0,
+              0,cos(theta),-sin(theta),
+              0,sin(theta),cos(theta)
+  );
+}
+
+vec3 rayDir(){
+  return normalize(vec3(x,y*0.5625,-0.4+(x*x+y*y)*0.1)); //function to generate ray directions based on current pixel
+}
+
+vec3 rayPos(Ray ray,float t){
+  return ray.direction*t+ray.origin;
+}
+
+vec3 worldColour(Ray ray){
+  return (vec3(1.0,0.8,0.6)*(1.0-ray.direction.y) + vec3(0.8,0.7,0.6)*ray.direction.y)*max(cos(uTime*0.05),0.0);
+}
+float random(float offset){
+  return fract(sin((x+offset)*(y+2.0))*43758.5453123);
+}
+vec3 randVec(float offset){
+  return vec3(random(10.0+offset)-0.5,random(20.0+offset)-0.5,random(30.0+offset)-0.5);
+}
+
+vec2 intersectVoxel(Ray ray, vec3 boxMin, vec3 boxMax) { // function to calulate intersections between a ray and a box/voxel
+  vec3 tMin = (boxMin - ray.origin) / ray.direction;
+  vec3 tMax = (boxMax - ray.origin) / ray.direction;
+  vec3 t1 = min(tMin, tMax);
+  vec3 t2 = max(tMin, tMax);
+  float tNear = max(max(t1.x, t1.y), t1.z);
+  float tFar = min(min(t2.x, t2.y), t2.z);
+  return vec2(tNear, tFar);//intersection with closes face and furthest face
+}
+
+
+Hit hitWorld(Ray ray){
+vec3 origin = ray.origin;
+float emisMul =1.0;
+bool startsTransparent = true;
+float ft; // if the ray does not start in the voxel grid, it will travel an extra lenght outide of the grid, so I must keep track of this extra distance to I can return the correct distance at the end of this function.
+vec3 vIndex; //variable to hold the current voxel durring the voxel ray march
+  if(!(abs(ray.origin.x)<sizeX && abs(ray.origin.y)<sizeY && abs(ray.origin.z)<sizeZ)){ //if we are outside of bounds we must find the voxel in which the ray first enters bounds so we can start the march from there.
+    vec2 gridIntersect = intersectVoxel(ray,-vec3(sizeX,sizeY,sizeZ),vec3(sizeX,sizeY,sizeZ));
+    if(gridIntersect.x < gridIntersect.y && gridIntersect.x > 0.0){ 
+      origin = rayPos(ray,gridIntersect.x);   
+      ft=gridIntersect.x;
+      startsTransparent = false;
+    }
+    else{
+      return Hit(nullVoxel,64.0,false,vec3(0.0),0.0);
+    }
+  }
+  vIndex = floor(origin); 
+  if(int(texelFetch(map,ivec3(int(vIndex.x),int(vIndex.y),int(vIndex.z))+ivec3(int(sizeX*0.5),int(sizeY*0.5),int(sizeZ*0.5)),0).w*255.0)!=4){// check if ray starts in a transparent material
+    startsTransparent = false;
+  }
+  float stepX =-1.0;
+  float stepY =-1.0;
+  float stepZ =-1.0;
+  if(ray.direction.x>0.0){
+    stepX = 1.0;
+  }
+  if(ray.direction.y>0.0){
+    stepY = 1.0;
+  }
+  if(ray.direction.z>0.0){
+    stepZ = 1.0;
+  }
+  vec3 step = vec3(stepX,stepY,stepZ); //conrolls what direction we step in each axis as we traverse the grid, if the direction in a particular axis is positive, we traverse in the positive direction for that axis.
+  
+  float nextboundX = vIndex.x;
+  float nextboundY = vIndex.y;
+  float nextboundZ = vIndex.z;
+  if(step.x> 0.0){
+    nextboundX+=1.0;
+  }
+  if(step.y> 0.0){
+    nextboundY+=1.0;
+  }
+  if(step.z> 0.0){
+    nextboundZ+=1.0;
+  }
+  vec3 nextBoundary = vec3(nextboundX,nextboundY,nextboundZ); // cords of next boundary the ray will cross;
+
+  vec3 tMax = (nextBoundary - origin) / ray.direction;
+  vec3 tDelta = 1.0/ray.direction *step;
+  float t;
+  vec3 normal = vec3(0.0,0.0,0.0);
+
+  for(int i =0; i<180 ; i++){
+    if(abs(vIndex.x)> sizeX|| abs(vIndex.y) > sizeY || abs(vIndex.z) > sizeZ){
+      break; // if vindex is greater than grid size, we are no longer in the voxel grid and can discard this ray.
+    }
+
+    vec4 tCol = texelFetch(map,ivec3(int(vIndex.x),int(vIndex.y),int(vIndex.z))+ivec3(int(sizeX*0.5),int(sizeY*0.5),int(sizeZ*0.5)),0); //fetch current voxel from the 3D texture that holds the map
+    if(tCol.w>0.0){ // if alpha of current voxel is not 0, we have hit something.
+      if(startsTransparent && int(tCol.w*255.0)!=4){
+        startsTransparent =false;
+      }
+      if(!startsTransparent){
+        if(tCol.r == 1.0 ||tCol.g == 1.0 || tCol.b == 1.0){
+          emisMul =20.0;
+        }
+        return Hit(Voxel(tCol.rgb*emisMul,int(tCol.w*255.0)-1,0.0),t,true,normal,0.0);
+      }
+    }
+    if(min(min(tMax.x,tMax.y),tMax.z) == tMax.x){// x plane is closest
+      t= tMax.x+ft;
+      vIndex += vec3(step.x,0.0,0.0);
+      tMax += vec3(tDelta.x,0.0,0.0);
+      normal = vec3(-step.x,0.0,0.0);
+    
+    }
+    else if(min(min(tMax.x,tMax.y),tMax.z) == tMax.y){ // y plane is closest
+      t= tMax.y +ft;
+      vIndex += vec3(0.0,step.y,0.0);
+      tMax += vec3(0.0,tDelta.y,0.0);   
+      normal = vec3(0.0,-step.y,0.0);       
+    }
+    else{ // z plane is closest
+      t= tMax.z+ft;
+      vIndex += vec3(0.0,0.0,step.z);
+      tMax += vec3(0.0,0.0,tDelta.z);
+      normal = vec3(0.0,0.0,-step.z);
+    }
+  }
+  return Hit(Voxel(vec3(0.0),0,0.0),64.0,false,vec3(0.0),0.0);
+}
+
+Hit hitWorldAO(Ray ray){
+vec3 origin = ray.origin;
+float emisMul =1.0;
+bool startsTransparent = true;
+float ft; // if the ray does not start in the voxel grid, it will travel an extra lenght outide of the grid, so I must keep track of this extra distance to I can return the correct distance at the end of this function.
+vec3 vIndex; //variable to hold the current voxel durring the voxel ray march
+  if(!(abs(ray.origin.x)<sizeX && abs(ray.origin.y)<sizeY && abs(ray.origin.z)<sizeZ)){ //if we are outside of bounds we must find the voxel in which the ray first enters bounds so we can start the march from there.
+    vec2 gridIntersect = intersectVoxel(ray,-vec3(sizeX,sizeY,sizeZ),vec3(sizeX,sizeY,sizeZ));
+    if(gridIntersect.x < gridIntersect.y && gridIntersect.x > 0.0){ 
+      origin = rayPos(ray,gridIntersect.x);   
+      ft=gridIntersect.x;
+      startsTransparent = false;
+    }
+    else{
+      return Hit(nullVoxel,64.0,false,vec3(0.0),0.0);
+    }
+  }
+  vIndex = floor(origin); 
+  if(int(texelFetch(map,ivec3(int(vIndex.x),int(vIndex.y),int(vIndex.z))+ivec3(int(sizeX*0.5),int(sizeY*0.5),int(sizeZ*0.5)),0).w*255.0)!=4){
+    startsTransparent = false;
+  }
+  float stepX =-1.0;
+  float stepY =-1.0;
+  float stepZ =-1.0;
+  if(ray.direction.x>0.0){
+    stepX = 1.0;
+  }
+  if(ray.direction.y>0.0){
+    stepY = 1.0;
+  }
+  if(ray.direction.z>0.0){
+    stepZ = 1.0;
+  }
+  vec3 step = vec3(stepX,stepY,stepZ); //conrolls what direction we step in each axis as we traverse the grid, if the direction in a particular axis is positive, we traverse in the positive direction for that axis.
+  
+  float nextboundX = vIndex.x;
+  float nextboundY = vIndex.y;
+  float nextboundZ = vIndex.z;
+  if(step.x> 0.0){
+    nextboundX+=1.0;
+  }
+  if(step.y> 0.0){
+    nextboundY+=1.0;
+  }
+  if(step.z> 0.0){
+    nextboundZ+=1.0;
+  }
+  vec3 nextBoundary = vec3(nextboundX,nextboundY,nextboundZ); // cords of next boundary the ray will cross;
+
+  vec3 tMax = (nextBoundary - origin) / ray.direction;
+  vec3 tDelta = 1.0/ray.direction *step;
+  float t;
+  vec3 normal = vec3(0.0,0.0,0.0);
+
+  for(int i =0; i<2 ; i++){
+    if(abs(vIndex.x)> sizeX|| abs(vIndex.y) > sizeY || abs(vIndex.z) > sizeZ){
+      break; // if vindex is greater than grid size, we are no longer in the voxel grid and can discard this ray.
+    }
+
+    vec4 tCol = texelFetch(map,ivec3(int(vIndex.x),int(vIndex.y),int(vIndex.z))+ivec3(int(sizeX*0.5),int(sizeY*0.5),int(sizeZ*0.5)),0); //fetch current voxel from the 3D texture that holds the map
+    if(tCol.w>0.0){ // if alpha of current voxel is not 0, we have hit something.
+      if(startsTransparent && int(tCol.w*255.0)!=4){
+        startsTransparent =false;
+      }
+      if(!startsTransparent){
+        if(tCol.r == 1.0 ||tCol.g == 1.0 || tCol.b == 1.0){
+          emisMul =10.0;
+        }
+        return Hit(Voxel(tCol.rgb*emisMul,int(tCol.w*255.0)-1,0.0),t,true,normal,0.0);
+      }
+    }
+    if(min(min(tMax.x,tMax.y),tMax.z) == tMax.x){// x plane is closest
+      t= tMax.x+ft;
+      vIndex += vec3(step.x,0.0,0.0);
+      tMax += vec3(tDelta.x,0.0,0.0);
+      normal = vec3(-step.x,0.0,0.0);
+    
+    }
+    else if(min(min(tMax.x,tMax.y),tMax.z) == tMax.y){ // y plane is closest
+      t= tMax.y +ft;
+      vIndex += vec3(0.0,step.y,0.0);
+      tMax += vec3(0.0,tDelta.y,0.0);   
+      normal = vec3(0.0,-step.y,0.0);       
+    }
+    else{ // z plane is closest
+      t= tMax.z+ft;
+      vIndex += vec3(0.0,0.0,step.z);
+      tMax += vec3(0.0,0.0,tDelta.z);
+      normal = vec3(0.0,0.0,-step.z);
+    }
+  }
+  return Hit(Voxel(vec3(0.0),0,0.0),64.0,false,vec3(0.0),0.0);
+}
+
+
+
+
+
+
+Ray veiwRay = Ray(vec3(0.0),vec3(0.0)); // create veiw ray from camera position to current pixel.
+
+void initialize() { // function to do setup before pixel can be rendered.
+  x = vPosition.x;// set x and y varriables to x&y position of the pixel being shaded.
+  y = vPosition.y;
+  sunDirection = normalize(vec3(cos(uTime*0.05),cos(uTime*0.05),0.5));
+  sunColour = vec3(0.9,0.7,0.4)*25.0*max(cos(uTime*0.05),0.0);
+  veiwRay.direction = rotY(thetaY)*rotX(thetaX) * rayDir(); //assign correct direction to veiwRay, calculated by getting ray direction then rotating this vector around the X & Y axis by thetaX and thetaY.
+  veiwRay.origin = cPos;
+}
+
+
+
+
+
+
+
+
+float random3(vec3 scale,float seed){// returns a random number based on a 3 vector, all my noise hash functions are from: https://gist.github.com/patriciogonzalezvivo/670c22f3966e662d2f83, I did not write them.
+  return fract(sin(dot(gl_FragCoord.xyz + seed, scale)) * 43758.5453 + seed);
+}
+
+vec3 importanceSampleDiffuse(float seed, vec3 normal) {// produces importance sampled random directions for a diffuse material, I did not write this. 
+  float u = random3(vec3(12.9898, 78.233, 151.7182), seed);
+  float v = random3(vec3(63.7264, 10.873, 623.6736), seed+1.0);
+  float r = sqrt(u);
+  float angle = 6.283185307179586 * v;
+      // compute basis from normal
+  vec3 sdir, tdir;
+  if (abs(normal.x)<0.5) {
+    sdir = cross(normal, vec3(1,0,0));
+  } else {
+    sdir = cross(normal, vec3(0,1,0));
+  }
+  tdir = cross(normal, sdir);
+  return r*cos(angle)*sdir + r*sin(angle)*tdir + sqrt(1.-u)*normal;
+}
+
+vec3 reflectDirection(vec3 normal, vec3 dir){// calculates reflected ray direction based on incident direction and normal
+  return  dir-2.0*dot(normal,dir)*normal;
+}
+
+
+float fresnel(vec3 direction, vec3 normal) { // Schlick approximation of fresnell, got this frome here: https://blog.demofox.org/2017/01/09/raytracing-reflection-refraction-fresnel-total-internal-reflection-and-beers-law/
+  vec3 nDirection = normalize( direction );
+  vec3 nNormal = normalize( normal );
+  vec3 halfDirection = normalize( nNormal + nDirection );
+  float cosine = dot( halfDirection, nDirection );
+  float product = max( cosine, 0.0 );
+  //float factor = invert ? 1.0 - pow( product, 5.0 ) : pow( product, 5.0 );
+  float factor = pow( product, 5.0 );
+  return factor;
+}
+
+vec3 scatterSolid(Ray ray, vec3 normal,float seed,int index){
+  vec3 diffuseDir = importanceSampleDiffuse(seed,normal); // calcuate diffuse component of final direction.
+  vec3 reflectedDir = reflectDirection(normal,ray.direction)+randVec(seed)*materials[index].roughness; // calculate specular component of final direction and add in random component based on rougness.
+  float selector = 1.0;
+  if(random(seed)>materials[index].diffuse && random(seed) < max(pow(fresnel(ray.direction,normal)*10.0,0.5),0.56)){// randomly select between reflection and refraction based on material paramters and fresnel
+    selector = 0.0;
+  }
+  return(diffuseDir*selector+reflectedDir*(1.0-selector));
+}
+
+float evaluateBRDF(Ray ray, vec3 normal,vec3 incidentDir, float seed, int index){ //phong BRDF
+  float lDotN = clamp(dot(incidentDir,normal),0.0,1.0);
+  vec3 reflectedSunDir = 2.0*lDotN*normal - incidentDir;
+  vec3 vecToCamera = -ray.direction;
+  return (materials[index].diffuse*lDotN + materials[index].specular*max(pow(dot(reflectedSunDir,vecToCamera),(1.0-materials[index].roughness)*100.0),0.001));
+}
+
+vec3 sampleColorFast(Ray ray,float seed){
+   Hit hit = hitWorld(veiwRay);
+    if(hit.hasHit){
+      vec3 hitPosition = rayPos(veiwRay,hit.minDist)+hit.normal*0.01;
+      float lDotN = clamp(dot(sunDirection,hit.normal),0.0,1.0);
+      vec3 reflectedSunDir = 2.0*lDotN*hit.normal - sunDirection;
+      vec3 vecToCamera = -veiwRay.direction;
+      float diffuse = 0.5;
+      float specular = 0.5;
+      float alpha = 100.0; 
+      
+      Ray reflectionRay = Ray(hitPosition,veiwRay.direction-2.0*dot(hit.normal,veiwRay.direction)*hit.normal);// create reflection ray
+      Hit reflectionHit = hitWorld(reflectionRay);
+      vec3 reflectColour = worldColour(reflectionRay);
+      if(reflectionHit.hasHit){ // if the reflected ray intersects the scene, do shading for it.
+        Hit reflectedShadowHit = hitWorld(Ray(rayPos(reflectionRay,reflectionHit.minDist)+reflectionHit.normal*0.01,sunDirection));// check for shadows at reflection ray intersection
+        reflectColour = ambientColor;
+        float relfectionLDotN = clamp(dot(sunDirection,reflectionHit.normal),0.0,1.0);
+        if(!reflectedShadowHit.hasHit){//if not occluded, add Phong illumination for reflection 
+          reflectColour += sunColour*(diffuse*relfectionLDotN + specular*max(pow(dot( 2.0*relfectionLDotN*reflectionHit.normal - sunDirection,-reflectionRay.direction),alpha),0.001))*hit.voxel.color;
+        }
+      }
+
+
+      Hit shadowHit = hitWorld(Ray(hitPosition,sunDirection));// check if light source is occluded from current point.
+      vec3 illumination = ambientColor;
+      if(!shadowHit.hasHit || hit.voxel.matIndex==3){//if not occluded, add Phong illumination
+        illumination += sunColour*(diffuse*lDotN + specular*max(pow(dot(reflectedSunDir,vecToCamera),alpha),0.001));
+      }
+
+      /*for(int i=0; i<4; i++){
+        Hit AOHit = HitWorldAO(ray);
+        if(AOHit.hasHit){
+          illumination-=0.25;
+        }
+      }*/
+
+      return mix((illumination+ reflectColour*specular)*hit.voxel.color,vec3(0.4,0.4,0.6),min(hit.minDist*0.01,1.0));
+    }
+    else{
+      return worldColour(veiwRay);
+    }
+}
+
+vec3 applyFog(vec3 rgb, float distance,Ray ray,vec3 illumination){
+    float fogAmount = (a/b) * exp(-ray.origin.y*b) * (1.0-exp( -distance*ray.direction.y*b ))/ray.direction.y;
+    return mix( rgb, fogColour*illumination, max(min(fogAmount,1.0),0.0));
+}
+
+
+
+vec3 sampleColor(Ray ray,float seed){// function to sample the colour along a ray
+  vec3 lighting = vec3(0.0); // accumulates lighting incident on point
+  vec3 baseColor = vec3(0.0); // accumulates bounce colour incident on point
+  vec3 volumetric = vec3(1.0);// accumulates volumetric lighting
+  float frac = 1.0; // deffines how much light is absorbed in each successive bounce.
+  Hit hit;
+  float veiwRayDist = 0.0;//distance from camera to first ray intersection
+  for(int depth=0;depth<3;depth++){// 3 bounces of light
+    hit = hitWorld(ray); // intersect world
+
+    if(depth==0){// if is veiw ray
+      vec3 randPointOnRay = rayPos(ray,hit.minDist*random(seed)); // random point on veiw ray
+      Ray volumetricRay = Ray(randPointOnRay,sunDirection+randVec(seed)*0.01);//ray from random point on veiw ray to sun
+      Hit volumetricHit = hitWorld(volumetricRay);
+      if(!volumetricHit.hasHit || volumetricHit.voxel.matIndex==3){// if dosent hit anything, accumulate volumetric lighting.
+        volumetric += sunColour*0.1;//*(randPointOnRay.y+5.0);// if no intersection, or hits transparent,acculate volumetric lighitng
+      }
+      veiwRayDist = hit.minDist;
+    }
+    
+    if(!hit.hasHit){// if veiw ray dosent hit anything
+      if(depth==0){
+        return applyFog(worldColour(ray),veiwRayDist,ray,volumetric);// if ray escapes imediatley, draw sky
+      }
+      lighting+=worldColour(ray)*2.0;// otherwise do lighing// frac?
+      break;
+    }
+    if(hit.voxel.color.r>1.0 || hit.voxel.color.g>1.0 || hit.voxel.color.b>1.0){// check if emmisive
+      if(depth==0){
+        return applyFog(hit.voxel.color,veiwRayDist,ray,volumetric)+hit.voxel.color*0.2;// if emmisive return emmisive colour
+      }
+      else{
+        lighting += hit.voxel.color;// otherwise accumulate lighting from emmisive
+      }
+      break;
+    }
+
+    vec3 hitPoint = rayPos(ray,hit.minDist)+hit.normal*0.001;// coordinate of ray intersection
+
+    if(!(hit.voxel.color.r>1.0 || hit.voxel.color.g>1.0 || hit.voxel.color.b>1.0)){// if not an emmisive
+      if(length(baseColor)==0.0){
+        baseColor += hit.voxel.color*frac; //accumulate colour from bounce
+      }
+      vec3 shadowDirection = sunDirection + randVec(seed+float(depth))*0.1;// ray from intersection point to random point on sun
+      Ray shadowRay = Ray(hitPoint,shadowDirection);
+      Hit shadowHit = hitWorld(shadowRay);
+      if(!shadowHit.hasHit || shadowHit.voxel.matIndex==3){
+        lighting += hit.voxel.color*sunColour*frac*evaluateBRDF(ray,hit.normal,sunDirection,seed+float(depth),hit.voxel.matIndex);
+      }
+    }
+    if(hit.voxel.matIndex==3){// if glass
+      if(random(seed+float(depth))>pow(fresnel(ray.direction,hit.normal)*10.0,2.0)){ //refract (use fresnell to decide)
+        vec3 refractedDir = refract(ray.direction,hit.normal,0.67)+randVec(seed+float(depth))*materials[hit.voxel.matIndex].roughness;
+        ray.origin= hitPoint+ray.direction*0.01;
+        ray.direction = refractedDir;
+      }
+      else{ // reflect
+        ray.origin = hitPoint;
+        ray.direction = scatterSolid(ray,hit.normal,seed+float(depth),hit.voxel.matIndex);
+      }
+    }
+    else{
+      ray.origin = hitPoint; // update ray origin to last intersection position
+      ray.direction = scatterSolid(ray,hit.normal,seed+float(depth),hit.voxel.matIndex);//evaluateBRDF(ray,hit.normal,seed+float(depth)); // choose new ray direction based on surface brdf
+    }
+    frac*=0.8;
+  }
+  return applyFog(lighting*baseColor/3.0,veiwRayDist,ray,volumetric); //calculate pixel colour for this sample.
+}
+
+void main(){
+  initialize();// set up shader variables to render a frame
+  vec3 colour = vec3(0.0);
+  vec4 gunTexel;
+  vec2 megaTextureUV = vec2((x+0.35)*1.429*0.125,(-y-0.2)*1.25*0.125);// calculate tex cords from screen cords
+  bool isUiElement = false;
+  if(abs(x)<0.35 && y<-0.2){
+    gunTexel =  texture(megaTexture,megaTextureUV);// sample megaTexture 
+    if(gunTexel.w>0.5){// if not transparent, draw gun to screen
+      isUiElement = true;
+    }
+  }
+
+  if(!isUiElement){// if not gun, draw scene normally.
+    for(int i=0;i<50;i++){
+      //veiwRay.direction += randVec(randSeed+float(i))*0.0012;
+      //veiwRay.origin += randVec(randSeed+float(i))*0.1;
+      colour += sampleColor(Ray(veiwRay.origin,veiwRay.direction + randVec(randSeed+float(i))*0.003),randSeed+float(i)); 
+    }
+    colour*=0.02;
+  }
+  else{
+    vec3 normal = texture(megaTexture,megaTextureUV+vec2(0.0,0.125)).rgb;// get normal from megatexture
+    vec3 gunLightingdir = rotY(thetaY)*rotX(thetaX)*normal+randVec(randSeed)*gunTexel.r*2.0;
+    Ray gunLightingRay = Ray(veiwRay.origin,vec3(-gunLightingdir.x,gunLightingdir.y,-gunLightingdir.z)); //ray coming from camera with normal direction rotated by camera rotation
+    vec3 gunLighting;
+    for(int i=0; i<5;i++){
+      gunLighting+=sampleColor(gunLightingRay,randSeed);
+    }
+    colour = gunTexel.rgb*gunLighting*0.2;// light the image.
+  }
+  //FragColor = vec4(colour,1.0);
+  FragColor = vec4(colour,1.0)*0.2+texture(lastFrame,vec2((x+1.0)*0.5,(y+1.0)*0.5))*0.8;
+  //FragColor = texture(megaTexture,vec2((x+1.0)*0.5,(y+1.0)*0.5));
+
+}
+</script>
+
+<!-- postprocessing shader -->
+<script id="fs2" type="x-shader/x-fragment">#version 300 es
+  precision mediump float;
+  out vec4 FragColor;
+  uniform sampler2D image;// pre post processing image.
+  uniform float rand;
+  in vec3 vPosition;
+  const float INV_PI = 0.31830988618379067153776752674503;
+  const float INV_SQRT_OF_2PI =0.39894228040143267793994605993439;
+  vec3 bloom = vec3(0.0);
+  vec2 uv;
+
+  vec4 avgTexture(vec2 uv){//I was using this to get the blured texture around the uV, but currently it just returns the texture at the uv.
+    return (texture(image,uv));
+  }
+
+  vec3 lumaBasedReinhardToneMapping(vec3 color){// code to do tonemapping, this is a modified version of the same function from: https://www.shadertoy.com/view/lslGzl
+      float exposure = 1.7;
+      color *= exposure/(1. + color / exposure);
+      color = pow(color, vec3(1. / 0.3));
+      return color;
+  }
+
+  float normal(float f){//evaluate normal/gaussian curve
+    return 0.39894*exp(-0.5*f*f);
+  }
+
+  float random(float offset){// random hash function coppied from path tracer
+    return fract(sin((uv.x+offset+rand)*(uv.y+2.0))*43758.5453123);
+  } 
+  void main(){
+    vec4 bloom;// accumulates bloom
+    float pX = 1.0/1280.0;// one over screen size
+    float pY = 1.0/720.0;
+    float blurX = pX*16.0;// blur size
+    float blurY = pY*16.0;
+    vec3 color = vec3(0.0);
+
+    uv = vec2((vPosition.x+1.0)*0.5,(vPosition.y+1.0)*0.5);
+  const float blurSize = 1.0/256.0;
+  
+
+  for(float i= -16.0;i<16.0;i++){
+    bloom +=texture(image, vec2(uv.x+(random(i)-0.5)*0.5, uv.y +i*blurSize)) * normal(i*0.1);// gaussian blur in x and y direction with random offfset for each sample to break it up a bit.
+  }
+  for(float i= -16.0;i<16.0;i++){
+    bloom +=texture(image, vec2(uv.x +i*blurSize, uv.y + (random(i)-0.5)*0.5)) * normal(i*0.1);
+  }
+    float vignette = uv.x*uv.y*0.64*(1.0-uv.x)*(1.0-uv.y);//vigette one liner from https://www.shadertoy.com/view/lsKSWR
+    vignette = clamp( pow( 16.0 * vignette, 0.3 ), 0.0, 1.0 );
+    vec4 preCol = vec4(avgTexture(uv).rgb,1.0);
+    float luminance = ((preCol.r * 0.3) + (preCol.g * 0.59) + (preCol.b * 0.11));
+    FragColor = vec4(lumaBasedReinhardToneMapping(preCol.rgb+bloom.rgb*0.05*(1.0-luminance*0.8)),1.0)*vignette; // do tonemapping+extra contrast 
+  }
+</script>
+<!-- copy shader -->
+<script id="fs3" type="x-shader/x-fragment">#version 300 es
+  precision mediump float;
+  out vec4 FragColor;
+  in vec3 vPosition;
+  uniform sampler2D image;
+  void main(){
+    vec2 uv = vec2((vPosition.x+1.0)*0.6,(vPosition.y+1.0)*0.4);
+    FragColor = texture(image,uv);
+  }
+</script>
+
+<script>
+    start_gl("canvas1", getStringFromDOMElement('vs'), getStringFromDOMElement('fs'),getStringFromDOMElement("fs2"),getStringFromDOMElement("fs3"));
+</script>
+</body>

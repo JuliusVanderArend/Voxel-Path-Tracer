@@ -1,0 +1,23 @@
+body{
+  background-color: black;
+}
+
+html {
+  margin: 0px;
+  overflow: hidden;
+}
+
+canvas { 
+  position: absolute; 
+  image-rendering: -moz-crisp-edges;
+  image-rendering: -webkit-crisp-edges;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  margin: 0px;
+}
+
+#canvas2 { 
+  z-index: 1; 
+  pointer-events: none;
+  margin: 0px;
+}
